@@ -10,7 +10,7 @@ import Test_OEE.assets as accuracy_module
 all_assets = load_assets_from_modules([accuracy_module])
 
 oee_daily_job = define_asset_job(
-    name="oee_daily_job",
+    name="OEE_TAMPO_daily",
     selection="*",
 )
 

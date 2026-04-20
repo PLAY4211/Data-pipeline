@@ -1,0 +1,32 @@
+# Dagster runtime
+.tmp_dagster_home_*/
+dagster_home/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data files (ไม่ขึ้น GitHub)
+*.xlsx
+*.xls
+*.csv
+*.db
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

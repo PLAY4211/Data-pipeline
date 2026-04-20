@@ -16,7 +16,7 @@ oee_daily_job = define_asset_job(
 
 daily_schedule = ScheduleDefinition(
     job=oee_daily_job,
-    cron_schedule="0 6 * * *",
+    cron_schedule="0 15 * * *",
 )
 
 defs = Definitions(

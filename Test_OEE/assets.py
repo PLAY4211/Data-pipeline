@@ -215,7 +215,7 @@ def _load_tp_format(file_path: str, log) -> pd.DataFrame:
 # STEP 1 : LOAD FILES & FIX MERGED HEADERS
 # =====================================================
 
-@asset
+@asset(group_name="Catch_Error_TAMPO")
 def oee_load_raw() -> pd.DataFrame:
     root_path = r"C:\Users\instulno\OneDrive - MATTEL INC\Desktop\Find Error OEE\example data2"
     debug = False
@@ -315,7 +315,7 @@ def oee_load_raw() -> pd.DataFrame:
 # STEP 2 : RENAME & CLEAN
 # =====================================================
 
-@asset
+@asset(group_name="Catch_Error_TAMPO")
 def oee_rename_clean(oee_load_raw: pd.DataFrame) -> pd.DataFrame:
     df = oee_load_raw.copy()
 
@@ -471,7 +471,7 @@ def oee_rename_clean(oee_load_raw: pd.DataFrame) -> pd.DataFrame:
 # STEP 3 : DOWNTIME CALCULATION
 # =====================================================
 
-@asset
+@asset(group_name="Catch_Error_TAMPO")
 def oee_with_downtime(oee_rename_clean: pd.DataFrame) -> pd.DataFrame:
     df = oee_rename_clean.copy()
 
@@ -647,7 +647,7 @@ def oee_with_downtime(oee_rename_clean: pd.DataFrame) -> pd.DataFrame:
 # STEP 4 : TIME LOGIC
 # =====================================================
 
-@asset
+@asset(group_name="Catch_Error_TAMPO")
 def oee_with_time_logic(oee_with_downtime: pd.DataFrame) -> pd.DataFrame:
     df = oee_with_downtime.copy()
 
@@ -753,7 +753,7 @@ def oee_with_time_logic(oee_with_downtime: pd.DataFrame) -> pd.DataFrame:
 # STEP 5 : AGGREGATION
 # =====================================================
 
-@asset
+@asset(group_name="Catch_Error_TAMPO")
 def oee_shift_summary(oee_with_time_logic: pd.DataFrame) -> pd.DataFrame:
     df = oee_with_time_logic.copy()
 
@@ -794,7 +794,7 @@ def oee_shift_summary(oee_with_time_logic: pd.DataFrame) -> pd.DataFrame:
 # STEP 6 : PREPARE COLUMNS & GHOST FILTER (FIXED)
 # =====================================================
 
-@asset
+@asset(group_name="Catch_Error_TAMPO")
 def oee_with_calculations(oee_shift_summary: pd.DataFrame) -> pd.DataFrame:
     shift_df = oee_shift_summary.copy()
 
@@ -856,7 +856,7 @@ def oee_with_calculations(oee_shift_summary: pd.DataFrame) -> pd.DataFrame:
 # STEP 7 : DATA ACCURACY ENGINE
 # =====================================================
 
-@asset
+@asset(group_name="Catch_Error_TAMPO")
 def oee_accuracy(oee_with_calculations: pd.DataFrame) -> pd.DataFrame:
     log = get_dagster_logger()
     shift_df = oee_with_calculations.copy()
@@ -967,7 +967,7 @@ def oee_accuracy(oee_with_calculations: pd.DataFrame) -> pd.DataFrame:
 # STEP 8 : EXPORT
 # =====================================================
 
-@asset
+@asset(group_name="Catch_Error_TAMPO")
 def export_oee(oee_with_time_logic: pd.DataFrame, oee_accuracy: pd.DataFrame) -> str:
     log = get_dagster_logger()
 

@@ -323,7 +323,7 @@ def oee_load_raw() -> pd.DataFrame:
     newly_processed  = []
 
     for file in files_to_process:
-        fname  = file.name
+        fname  = str(file.relative_to(root))
         mtime  = os.path.getmtime(file)
         status = "new" if file in new_files else "updated"
         log.info(f"  [{status.upper()}] กำลังประมวลผล: {fname}")
@@ -428,8 +428,9 @@ def oee_load_raw() -> pd.DataFrame:
 
         # อัพเดท status ไฟล์ที่ไม่เปลี่ยนแปลงใน log
         for f in unchanged_files:
-            if f.name in file_log:
-                file_log[f.name]["run_status"] = "unchanged"
+            fname_unch = str(f.relative_to(root))
+            if fname_unch in file_log:
+                file_log[fname_unch]["run_status"] = "unchanged"
     else:
         combined = cache_df
 
@@ -1170,11 +1171,15 @@ def export_oee(oee_with_time_logic: pd.DataFrame, oee_accuracy: pd.DataFrame) ->
             workbook.strings_to_urls     = False
             workbook.strings_to_formulas = False
 
-            raw_year.to_excel(writer,                    sheet_name="Raw_Processed",  index=False)
+            # raw_year ไม่ใส่ใน Excel เพราะ rows เกิน limit → save เป็น CSV แทน
             clean_summary(acc_year).to_excel(writer,     sheet_name="Summary_By_Shift", index=False)
             clean_summary(healthy_df).to_excel(writer,   sheet_name="Healthy_Data",   index=False)
             clean_summary(warning_df).to_excel(writer,   sheet_name="Warning",        index=False)
             clean_summary(error_df).to_excel(writer,     sheet_name="Error",          index=False)
+
+        # save Raw_Processed เป็น CSV แยกไฟล์
+        raw_csv = output_folder / f"Raw_Processed_{year}.csv"
+        raw_year.to_csv(raw_csv, index=False, encoding="utf-8-sig")
 
         total  = len(acc_year)
         n_ok   = len(healthy_df)

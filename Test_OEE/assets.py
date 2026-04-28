@@ -3,8 +3,52 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import datetime
+import json
+import os
 
 from dagster import asset, get_dagster_logger
+
+
+# =====================================================
+# INCREMENTAL UPDATE — CACHE & LOG
+# =====================================================
+
+CACHE_DIR  = Path(r"C:\Users\instulno\OneDrive - MATTEL INC\Desktop\Find Error OEE\pipeline_cache")
+LOG_FILE   = CACHE_DIR / "processed_log.json"
+CACHE_FILE = CACHE_DIR / "data_cache.parquet"
+
+
+def _load_log() -> dict:
+    """โหลด log จากไฟล์ ถ้ายังไม่มีให้ return โครงสร้างเปล่า"""
+    if LOG_FILE.exists():
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"last_run": None, "files": {}}
+
+
+def _save_log(log: dict):
+    """บันทึก log ลงไฟล์"""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    log["last_run"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(log, f, ensure_ascii=False, indent=2)
+
+
+def _load_cache() -> pd.DataFrame:
+    """โหลด processed data cache ถ้ามี"""
+    if CACHE_FILE.exists():
+        return pd.read_parquet(CACHE_FILE)
+    return pd.DataFrame()
+
+
+def _save_cache(df: pd.DataFrame):
+    """บันทึก cache ลงไฟล์ Parquet"""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    df_save = df.copy()
+    # แปลง object columns ที่มี mixed types ให้เป็น string ก่อน save
+    for col in df_save.select_dtypes(include="object").columns:
+        df_save[col] = df_save[col].astype(str).where(df_save[col].notna(), other=None)
+    df_save.to_parquet(CACHE_FILE, index=False)
 
 
 # =====================================================
@@ -217,8 +261,7 @@ def _load_tp_format(file_path: str, log) -> pd.DataFrame:
 
 @asset(group_name="Catch_Error_TAMPO")
 def oee_load_raw() -> pd.DataFrame:
-    root_path = r"C:\Users\instulno\OneDrive - MATTEL INC\Desktop\Find Error OEE\example data2"
-    debug = False
+    root_path = r"Z:\TAMPO\00. OEE TAMPO PROCESS 2024\ไฟล์กรอกข้อมูล OEE TP"
     log = get_dagster_logger()
 
     root = Path(root_path)
@@ -233,20 +276,59 @@ def oee_load_raw() -> pd.DataFrame:
             log.info("🗂️  TP format detected — loading TP_Output / TP_Downtime / TP_Defect")
             return _load_tp_format(str(root), log)
 
-    # ── Old format: scan folder for xlsx files ────────────────────────────────
     if root.is_file():
-        # ไฟล์เดี่ยวที่ไม่ใช่ TP format → scan parent folder
         root = root.parent
 
-    if debug:
-        log.info(f"📂 Start processing: {root}")
+    # ── โหลด Log และ Cache ───────────────────────────────────────────────────
+    run_log   = _load_log()
+    cache_df  = _load_cache()
+    file_log  = run_log.get("files", {})
 
-    all_df = []
-    excel_files = list(root.rglob("*.xlsx"))
+    excel_files = [f for f in root.rglob("*.xlsx") if not f.name.startswith("~$")]
+
+    new_files      = []   # ไฟล์ใหม่ที่ยังไม่เคยประมวลผล
+    updated_files  = []   # ไฟล์เดิมที่มีการแก้ไข
+    unchanged_files = []  # ไฟล์เดิมที่ไม่มีการเปลี่ยนแปลง
 
     for file in excel_files:
-        if file.name.startswith("~$"):
-            continue
+        # ใช้ relative path เป็น key เพื่อป้องกันไฟล์ชื่อเดียวกันในโฟลเดอร์ต่างปี
+        # เช่น "2024/OEE_WK01.xlsx" vs "2025/OEE_WK01.xlsx"
+        fname = str(file.relative_to(root))
+        mtime = os.path.getmtime(file)
+
+        if fname not in file_log:
+            new_files.append(file)
+        elif file_log[fname]["file_mtime"] != mtime:
+            updated_files.append(file)
+        else:
+            unchanged_files.append(file)
+
+    log.info("=" * 60)
+    log.info("INCREMENTAL UPDATE SUMMARY")
+    log.info("=" * 60)
+    log.info(f"ไฟล์ใหม่      : {len(new_files)}  ไฟล์")
+    log.info(f"ไฟล์อัพเดท    : {len(updated_files)}  ไฟล์")
+    log.info(f"ไฟล์ไม่เปลี่ยน : {len(unchanged_files)}  ไฟล์")
+    log.info("=" * 60)
+
+    # ── ถ้าไม่มีอะไรใหม่เลย ใช้ Cache ได้เลย ────────────────────────────────
+    if not new_files and not updated_files:
+        log.info("✅ ไม่มีไฟล์ใหม่หรืออัพเดท — ใช้ข้อมูลจาก Cache")
+        if cache_df.empty:
+            raise ValueError("Cache ว่างเปล่า และไม่มีไฟล์ใหม่")
+        return cache_df
+
+    # ── ประมวลผลเฉพาะไฟล์ใหม่ + ไฟล์ที่อัพเดท ──────────────────────────────
+    files_to_process = new_files + updated_files
+    newly_processed  = []
+
+    for file in files_to_process:
+        fname  = file.name
+        mtime  = os.path.getmtime(file)
+        status = "new" if file in new_files else "updated"
+        log.info(f"  [{status.upper()}] กำลังประมวลผล: {fname}")
+
+        file_rows = []
         try:
             xls = pd.ExcelFile(file, engine="calamine")
             for sheet in xls.sheet_names:
@@ -279,10 +361,8 @@ def oee_load_raw() -> pd.DataFrame:
                 ]
 
                 for t, b in zip(top_s, bot_h):
-                    if b.lower() == "nan":
-                        b = ""
-                    if t.lower() == "nan":
-                        t = ""
+                    if b.lower() == "nan": b = ""
+                    if t.lower() == "nan": t = ""
                     if b in dt_subcols and t != "":
                         new_cols.append(f"{t}|{b}")
                     elif b != "":
@@ -297,18 +377,75 @@ def oee_load_raw() -> pd.DataFrame:
                 temp_df = temp_df.loc[:, ~temp_df.columns.str.contains("^Unnamed|^$")]
                 temp_df = temp_df.loc[:, ~temp_df.columns.duplicated(keep="first")]
 
-                temp_df["source_file"] = file.name
+                # source_file ใช้ relative path เพื่อแยกไฟล์ต่างปีที่ชื่อเหมือนกัน
+                temp_df["source_file"]  = fname   # เช่น "2024\OEE_WK01.xlsx"
                 temp_df["source_sheet"] = sheet
+                file_rows.append(temp_df)
 
-                all_df.append(temp_df)
         except Exception as e:
-            log.error(f"❌ Cannot read {file.name}: {e}")
+            log.error(f"  ❌ Cannot read {fname}: {e}")
+            continue
 
-    if not all_df:
+        if not file_rows:
+            continue
+
+        file_df   = pd.concat(file_rows, ignore_index=True)
+        rows_extracted = len(file_df)
+        newly_processed.append(file_df)
+
+        # ── บันทึก log ──────────────────────────────────────────────────────
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if status == "updated" and fname in file_log:
+            prev_rows = file_log[fname].get("rows_extracted", 0)
+            log.info(f"    rows เดิม: {prev_rows:,}  →  rows ใหม่: {rows_extracted:,}")
+            file_log[fname].update({
+                "last_processed": now_str,
+                "file_mtime":     mtime,
+                "rows_extracted": rows_extracted,
+                "run_status":     "updated",
+            })
+        else:
+            log.info(f"    rows ใหม่: {rows_extracted:,}")
+            file_log[fname] = {
+                "first_processed": now_str,
+                "last_processed":  now_str,
+                "file_mtime":      mtime,
+                "rows_extracted":  rows_extracted,
+                "run_status":      "new",
+            }
+
+    # ── Merge Cache + ข้อมูลใหม่ ─────────────────────────────────────────────
+    if newly_processed:
+        new_df = pd.concat(newly_processed, ignore_index=True)
+
+        # ลบข้อมูลเก่าของไฟล์ที่ถูก update ออกจาก cache ก่อน merge
+        updated_names = [str(f.relative_to(root)) for f in updated_files]
+        if not cache_df.empty and updated_names and "source_file" in cache_df.columns:
+            cache_df = cache_df[~cache_df["source_file"].isin(updated_names)]
+
+        combined = pd.concat([cache_df, new_df], ignore_index=True) if not cache_df.empty else new_df
+        _save_cache(combined)
+
+        # อัพเดท status ไฟล์ที่ไม่เปลี่ยนแปลงใน log
+        for f in unchanged_files:
+            if f.name in file_log:
+                file_log[f.name]["run_status"] = "unchanged"
+    else:
+        combined = cache_df
+
+    # ── บันทึก Log ───────────────────────────────────────────────────────────
+    run_log["files"] = file_log
+    _save_log(run_log)
+
+    log.info("=" * 60)
+    log.info(f"✅ Total rows: {len(combined):,}")
+    log.info(f"📄 Log saved : {LOG_FILE}")
+    log.info("=" * 60)
+
+    if combined.empty:
         raise ValueError("ไม่พบข้อมูลที่ใช้งานได้")
 
-    df = pd.concat(all_df, ignore_index=True)
-    return df
+    return combined
 
 
 # =====================================================
@@ -868,8 +1005,10 @@ def oee_accuracy(oee_with_calculations: pd.DataFrame) -> pd.DataFrame:
         # ── NO-PLAN SHIFT ───────────────────────────────────────────────────────
         # กะที่ไม่มีแผนผลิต (No_Plan_Min เต็ม หรือ PM/หยุดสายทั้งกะ)
         # ลักษณะ: Net_Plantime=0 → Working_time_min=0, Total_Output=0
-        # → Healthy Data เสมอ ไม่ต้องตรวจ rule ใด
+        # ข้อยกเว้น: ถ้ามี Defect_Pcs > 0 ทั้งที่ไม่มีการผลิต → Error (บันทึกผิด)
         if row["Net_Plantime"] == 0 and row["Working_time_min"] == 0 and row["ยอดผลิต"] == 0:
+            if row["Defect_Pcs"] > 0:
+                return pd.Series(["Error", "DEFECT_ON_NO_PLAN_SHIFT", 1, 0])
             return pd.Series(["Healthy Data", "", 0, 0])
 
         # ── LOGIC GROUP 1 : DEFECT ──────────────────────────────────────────────
@@ -964,7 +1103,7 @@ def oee_accuracy(oee_with_calculations: pd.DataFrame) -> pd.DataFrame:
 
 
 # =====================================================
-# STEP 8 : EXPORT
+# STEP 8 : EXPORT (แยกรายปี)
 # =====================================================
 
 @asset(group_name="Catch_Error_TAMPO")
@@ -972,27 +1111,16 @@ def export_oee(oee_with_time_logic: pd.DataFrame, oee_accuracy: pd.DataFrame) ->
     log = get_dagster_logger()
 
     output_folder = Path(
-        r"C:\Users\instulno\OneDrive - MATTEL INC\Desktop\Find Error OEE"
+        r"C:\Users\instulno\OneDrive - MATTEL INC\Desktop\Find Error OEE\output"
     )
     output_folder.mkdir(parents=True, exist_ok=True)
-    output_file = output_folder / "cleaned_oee_with_accuracy.xlsx"
-
-    healthy_df = oee_accuracy[oee_accuracy["Data_Accuracy_Status"] == "Healthy Data"]
-    warning_df = oee_accuracy[oee_accuracy["Data_Accuracy_Status"] == "Warning"]
-    error_df   = oee_accuracy[oee_accuracy["Data_Accuracy_Status"] == "Error"]
 
     drop_raw_cols     = ["td_start", "td_end"]
     drop_summary_cols = [
         "Total_Calendar_Min", "A_Available_Min", "B_Performance_Min",
         "Low_Speed_Min", "C_Quality_Min", "D_Net_Min",
     ]
-
-    raw_export = oee_with_time_logic.drop(
-        columns=[c for c in drop_raw_cols if c in oee_with_time_logic.columns]
-    )
-    raw_export = raw_export.sort_values(
-        ["Date", "Machine No", "Shift", "start_dt"]
-    ).reset_index(drop=True)
+    drop_dup_cols = ["ยอดผลิต", "Defect_Pcs"]
 
     SUMMARY_COL_ORDER = [
         "Date", "Machine No", "Shift", "shift_start", "shift_end",
@@ -1004,38 +1132,63 @@ def export_oee(oee_with_time_logic: pd.DataFrame, oee_accuracy: pd.DataFrame) ->
         "Data_Accuracy_Status", "Issue_List", "Error_Count", "Warning_Count",
     ]
 
-    drop_dup_cols = ["ยอดผลิต", "Defect_Pcs"]
-
     def clean_summary(df):
-        df = df.drop(
-            columns=[
-                c for c in drop_summary_cols + drop_dup_cols if c in df.columns
-            ]
-        )
-        ordered    = [c for c in SUMMARY_COL_ORDER if c in df.columns]
-        remaining  = [c for c in df.columns if c not in ordered]
+        df = df.drop(columns=[c for c in drop_summary_cols + drop_dup_cols if c in df.columns])
+        ordered   = [c for c in SUMMARY_COL_ORDER if c in df.columns]
+        remaining = [c for c in df.columns if c not in ordered]
         return df[ordered + remaining]
 
-    with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
-        workbook = writer.book
-        workbook.strings_to_urls     = False
-        workbook.strings_to_formulas = False
+    # ── เตรียม raw data ───────────────────────────────────────────────────────
+    raw_export = oee_with_time_logic.drop(
+        columns=[c for c in drop_raw_cols if c in oee_with_time_logic.columns]
+    ).sort_values(["Date", "Machine No", "Shift", "start_dt"]).reset_index(drop=True)
 
-        raw_export.to_excel(
-            writer, sheet_name="Raw_Processed", index=False
-        )
-        clean_summary(oee_accuracy).to_excel(
-            writer, sheet_name="Summary_By_Shift", index=False
-        )
-        clean_summary(healthy_df).to_excel(
-            writer, sheet_name="Healthy_Data", index=False
-        )
-        clean_summary(warning_df).to_excel(
-            writer, sheet_name="Warning", index=False
-        )
-        clean_summary(error_df).to_excel(
-            writer, sheet_name="Error", index=False
-        )
+    # ── แยกตามปี ─────────────────────────────────────────────────────────────
+    oee_accuracy["_year"] = pd.to_datetime(oee_accuracy["Date"], errors="coerce").dt.year
+    raw_export["_year"]   = pd.to_datetime(raw_export["Date"],   errors="coerce").dt.year
 
-    log.info(f"✅ Done. Output: {output_file}")
-    return str(output_file)
+    years = sorted(oee_accuracy["_year"].dropna().unique().astype(int))
+
+    log.info("=" * 60)
+    log.info("EXPORT — แยกรายปี")
+    log.info("=" * 60)
+
+    output_files = []
+
+    for year in years:
+        acc_year = oee_accuracy[oee_accuracy["_year"] == year].drop(columns=["_year"])
+        raw_year = raw_export[raw_export["_year"] == year].drop(columns=["_year"])
+
+        healthy_df = acc_year[acc_year["Data_Accuracy_Status"] == "Healthy Data"]
+        warning_df = acc_year[acc_year["Data_Accuracy_Status"] == "Warning"]
+        error_df   = acc_year[acc_year["Data_Accuracy_Status"] == "Error"]
+
+        output_file = output_folder / f"OEE_Accuracy_{year}.xlsx"
+
+        with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
+            workbook = writer.book
+            workbook.strings_to_urls     = False
+            workbook.strings_to_formulas = False
+
+            raw_year.to_excel(writer,                    sheet_name="Raw_Processed",  index=False)
+            clean_summary(acc_year).to_excel(writer,     sheet_name="Summary_By_Shift", index=False)
+            clean_summary(healthy_df).to_excel(writer,   sheet_name="Healthy_Data",   index=False)
+            clean_summary(warning_df).to_excel(writer,   sheet_name="Warning",        index=False)
+            clean_summary(error_df).to_excel(writer,     sheet_name="Error",          index=False)
+
+        total  = len(acc_year)
+        n_ok   = len(healthy_df)
+        n_warn = len(warning_df)
+        n_err  = len(error_df)
+        log.info(f"  📄 {output_file.name}  —  {total:,} rows  "
+                 f"| Healthy {n_ok:,}  Warning {n_warn:,}  Error {n_err:,}")
+        output_files.append(str(output_file))
+
+    oee_accuracy.drop(columns=["_year"], inplace=True, errors="ignore")
+    raw_export.drop(columns=["_year"],   inplace=True, errors="ignore")
+
+    log.info("=" * 60)
+    log.info(f"✅ Export เสร็จ {len(years)} ไฟล์ → {output_folder}")
+    log.info("=" * 60)
+
+    return "\n".join(output_files)

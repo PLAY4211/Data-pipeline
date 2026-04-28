@@ -13,9 +13,11 @@ from dagster import asset, get_dagster_logger
 # INCREMENTAL UPDATE — CACHE & LOG
 # =====================================================
 
-CACHE_DIR  = Path(r"C:\Users\instulno\OneDrive - MATTEL INC\Desktop\Find Error OEE\pipeline_cache")
-LOG_FILE   = CACHE_DIR / "processed_log.json"
-CACHE_FILE = CACHE_DIR / "data_cache.parquet"
+CACHE_DIR        = Path(r"C:\Users\instulno\OneDrive - MATTEL INC\Desktop\Find Error OEE\pipeline_cache")
+LOG_FILE         = CACHE_DIR / "processed_log.json"
+CACHE_FILE       = CACHE_DIR / "data_cache.parquet"
+ACCURACY_CACHE   = CACHE_DIR / "accuracy_cache.parquet"
+RAW_EXPORT_CACHE = CACHE_DIR / "raw_export_cache.parquet"
 
 
 def _load_log() -> dict:
@@ -34,6 +36,11 @@ def _save_log(log: dict):
         json.dump(log, f, ensure_ascii=False, indent=2)
 
 
+def _is_cache_hit(df: pd.DataFrame) -> bool:
+    """ตรวจว่า DataFrame ที่รับมาคือ sentinel จาก oee_load_raw (ไม่มีไฟล์ใหม่)"""
+    return "_cache_hit" in df.columns and bool(df["_cache_hit"].any())
+
+
 def _load_cache() -> pd.DataFrame:
     """โหลด processed data cache ถ้ามี"""
     if CACHE_FILE.exists():
@@ -49,6 +56,15 @@ def _save_cache(df: pd.DataFrame):
     for col in df_save.select_dtypes(include="object").columns:
         df_save[col] = df_save[col].astype(str).where(df_save[col].notna(), other=None)
     df_save.to_parquet(CACHE_FILE, index=False)
+
+
+def _save_cache_generic(df: pd.DataFrame, path: Path):
+    """บันทึก DataFrame ใดๆ ลง Parquet path ที่กำหนด"""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    df_save = df.copy()
+    for col in df_save.select_dtypes(include="object").columns:
+        df_save[col] = df_save[col].astype(str).where(df_save[col].notna(), other=None)
+    df_save.to_parquet(path, index=False)
 
 
 # =====================================================
@@ -314,6 +330,12 @@ def oee_load_raw() -> pd.DataFrame:
     # ── ถ้าไม่มีอะไรใหม่เลย ใช้ Cache ได้เลย ────────────────────────────────
     if not new_files and not updated_files:
         log.info("✅ ไม่มีไฟล์ใหม่หรืออัพเดท — ใช้ข้อมูลจาก Cache")
+        if not ACCURACY_CACHE.exists() or not RAW_EXPORT_CACHE.exists():
+            log.info("⚠️  Accuracy/Raw cache ยังไม่มี — ต้อง process ครั้งแรกก่อน")
+        else:
+            # ส่ง sentinel DataFrame ขนาดเล็กไปบอก step ถัดๆ ไปให้ข้ามได้เลย
+            sentinel = pd.DataFrame({"_cache_hit": [True]})
+            return sentinel
         if cache_df.empty:
             raise ValueError("Cache ว่างเปล่า และไม่มีไฟล์ใหม่")
         return cache_df
@@ -455,6 +477,8 @@ def oee_load_raw() -> pd.DataFrame:
 
 @asset(group_name="Catch_Error_TAMPO")
 def oee_rename_clean(oee_load_raw: pd.DataFrame) -> pd.DataFrame:
+    if _is_cache_hit(oee_load_raw):
+        return oee_load_raw  # pass sentinel ต่อไป
     df = oee_load_raw.copy()
 
     rename_map = {
@@ -611,6 +635,8 @@ def oee_rename_clean(oee_load_raw: pd.DataFrame) -> pd.DataFrame:
 
 @asset(group_name="Catch_Error_TAMPO")
 def oee_with_downtime(oee_rename_clean: pd.DataFrame) -> pd.DataFrame:
+    if _is_cache_hit(oee_rename_clean):
+        return oee_rename_clean
     df = oee_rename_clean.copy()
 
     def parse_minutes_vec(series):
@@ -787,6 +813,8 @@ def oee_with_downtime(oee_rename_clean: pd.DataFrame) -> pd.DataFrame:
 
 @asset(group_name="Catch_Error_TAMPO")
 def oee_with_time_logic(oee_with_downtime: pd.DataFrame) -> pd.DataFrame:
+    if _is_cache_hit(oee_with_downtime):
+        return oee_with_downtime
     df = oee_with_downtime.copy()
 
     def safe_convert_time(col_name):
@@ -893,6 +921,8 @@ def oee_with_time_logic(oee_with_downtime: pd.DataFrame) -> pd.DataFrame:
 
 @asset(group_name="Catch_Error_TAMPO")
 def oee_shift_summary(oee_with_time_logic: pd.DataFrame) -> pd.DataFrame:
+    if _is_cache_hit(oee_with_time_logic):
+        return oee_with_time_logic
     df = oee_with_time_logic.copy()
 
     def join_unique(x):
@@ -934,6 +964,8 @@ def oee_shift_summary(oee_with_time_logic: pd.DataFrame) -> pd.DataFrame:
 
 @asset(group_name="Catch_Error_TAMPO")
 def oee_with_calculations(oee_shift_summary: pd.DataFrame) -> pd.DataFrame:
+    if _is_cache_hit(oee_shift_summary):
+        return oee_shift_summary
     shift_df = oee_shift_summary.copy()
 
     shift_df["Plan_time"] = (
@@ -997,6 +1029,13 @@ def oee_with_calculations(oee_shift_summary: pd.DataFrame) -> pd.DataFrame:
 @asset(group_name="Catch_Error_TAMPO")
 def oee_accuracy(oee_with_calculations: pd.DataFrame) -> pd.DataFrame:
     log = get_dagster_logger()
+
+    if _is_cache_hit(oee_with_calculations):
+        log.info("⚡ Cache hit — โหลด oee_accuracy จาก cache (ข้ามการคำนวณ)")
+        if not ACCURACY_CACHE.exists():
+            raise ValueError("Accuracy cache ไม่มี — ลบ processed_log.json แล้วรันใหม่")
+        return pd.read_parquet(ACCURACY_CACHE)
+
     shift_df = oee_with_calculations.copy()
 
     def data_accuracy_engine(row):
@@ -1100,6 +1139,10 @@ def oee_accuracy(oee_with_calculations: pd.DataFrame) -> pd.DataFrame:
     log.info(f"Warning        : {warning_pct:6.2f}%  ({warning:,} rows)  {'█' * int(warning_pct / 2)}")
     log.info(f"Error          : {error_pct:6.2f}%  ({error:,} rows)  {'█' * int(error_pct / 2)}")
 
+    # บันทึก accuracy cache เพื่อใช้ครั้งถัดไปถ้าไม่มีไฟล์ใหม่
+    _save_cache_generic(shift_df, ACCURACY_CACHE)
+    log.info(f"💾 Accuracy cache saved → {ACCURACY_CACHE}")
+
     return shift_df
 
 
@@ -1140,9 +1183,18 @@ def export_oee(oee_with_time_logic: pd.DataFrame, oee_accuracy: pd.DataFrame) ->
         return df[ordered + remaining]
 
     # ── เตรียม raw data ───────────────────────────────────────────────────────
-    raw_export = oee_with_time_logic.drop(
-        columns=[c for c in drop_raw_cols if c in oee_with_time_logic.columns]
-    ).sort_values(["Date", "Machine No", "Shift", "start_dt"]).reset_index(drop=True)
+    if _is_cache_hit(oee_with_time_logic):
+        log.info("⚡ Cache hit — โหลด raw_export จาก cache")
+        if not RAW_EXPORT_CACHE.exists():
+            raise ValueError("Raw export cache ไม่มี — ลบ processed_log.json แล้วรันใหม่")
+        raw_export = pd.read_parquet(RAW_EXPORT_CACHE)
+    else:
+        raw_export = oee_with_time_logic.drop(
+            columns=[c for c in drop_raw_cols if c in oee_with_time_logic.columns]
+        ).sort_values(["Date", "Machine No", "Shift", "start_dt"]).reset_index(drop=True)
+        # บันทึก raw_export cache
+        _save_cache_generic(raw_export, RAW_EXPORT_CACHE)
+        log.info(f"💾 Raw export cache saved → {RAW_EXPORT_CACHE}")
 
     # ── แยกตามปี ─────────────────────────────────────────────────────────────
     oee_accuracy["_year"] = pd.to_datetime(oee_accuracy["Date"], errors="coerce").dt.year
